@@ -369,7 +369,7 @@
                     <div class="flex items-center space-x-6">
                         <div>
                             <label class="block text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest mb-1">Periodo Laboral</label>
-                            <input type="month" id="month-picker" value="2026-11" onchange="initTable()" class="input-neo rounded-xl px-3 py-1.5 text-xs font-bold font-mono text-sky-600 dark:text-sky-300">
+                            <input type="month" id="month-picker" value="2026-11" onchange="changeSchedulePeriod()" class="input-neo rounded-xl px-3 py-1.5 text-xs font-bold font-mono text-sky-600 dark:text-sky-300">
                         </div>
                         <div>
                             <label class="block text-[10px] font-bold text-slate-500 dark:text-slate-400 uppercase tracking-widest mb-1">Meta Horas / Empleado</label>
@@ -583,8 +583,37 @@
         </div>
     </div>
 
+    <!-- Firebase SDK (compat) para autenticación y Firestore -->
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+
     <!-- JAVASCRIPT LOGIC CON SOPORTE DE TEMAS -->
     <script>
+        // FIREBASE: autenticación existente y almacenamiento de horarios.
+        const firebaseConfig = {
+            apiKey: "AIzaSyC2yJHAsFqjPTmgVHSMXIVm1ogz8sdFDPM",
+            authDomain: "controlhorariosisss.firebaseapp.com",
+            projectId: "controlhorariosisss",
+            storageBucket: "controlhorariosisss.firebasestorage.app",
+            messagingSenderId: "669000235800",
+            appId: "1:669000235800:web:8c97d55e7f4c883b23fc6d",
+            measurementId: "G-FJ6D3CPTP7"
+        };
+        if (!firebase.apps.length) firebase.initializeApp(firebaseConfig);
+        const firebaseAuth = firebase.auth();
+        const firestoreDb = firebase.firestore();
+        let firebaseSaveTimer = null;
+        let firebaseSaveInProgress = Promise.resolve();
+        const FIREBASE_EMAIL_BY_ACCOUNT = {
+            // Las claves coinciden con el usuario que devuelve baseAccountName().
+            // Se admiten tanto los nombres cortos como los correos usados en la hoja.
+            carlos: "carlosmarcenaro64@gmail.com",
+            krissia: "Krissia.rosa@isss.gob.sv",
+            "carlosmarcenaro64@gmail.com": "carlosmarcenaro64@gmail.com",
+            "krissia.rosa@isss.gob.sv": "Krissia.rosa@isss.gob.sv"
+        };
+
         // ESTADO Y LÓGICA DE TEMA (CLARO / OSCURO)
         let isDarkMode = false;
 
@@ -901,9 +930,24 @@
                     const baseAccount = DB_USERS[entered];
                     const validBase = baseAccount &&
                         String(baseAccount.password) === String(password);
-
                     if (!validBase) {
                         throw new Error("Usuario o contraseña incorrectos. Verifique el usuario y la contraseña en A:B.");
+                    }
+
+                    // Se autentica también contra Firebase con el mismo correo y contraseña.
+                    const firebaseEmail = FIREBASE_EMAIL_BY_ACCOUNT[entered];
+                    if (!firebaseEmail) throw new Error("Esta cuenta aún no tiene un correo vinculado a Firebase.");
+                    try {
+                        await firebaseAuth.signInWithEmailAndPassword(firebaseEmail, password);
+                    } catch (firebaseError) {
+                        console.error("Firebase Authentication:", firebaseError);
+                        const messages = {
+                            "auth/wrong-password": "La contraseña de Firebase no coincide con la contraseña ingresada.",
+                            "auth/invalid-credential": "Las credenciales de Firebase no son válidas. Verifique el correo y la contraseña registrados.",
+                            "auth/user-not-found": "El correo de esta cuenta no existe en Firebase Authentication.",
+                            "auth/too-many-requests": "Firebase bloqueó temporalmente los intentos. Espere e inténtelo nuevamente."
+                        };
+                        throw new Error(messages[firebaseError.code] || ("No se pudo iniciar sesión en Firebase: " + (firebaseError.message || firebaseError.code)));
                     }
 
                     currentBaseUsername = entered;
@@ -970,9 +1014,8 @@
         }
 
         function goHome() {
-            // La matriz no tiene persistencia porque el historial fue retirado.
-            // Se limpia al cambiar de institución para impedir que horarios temporales
-            // de una institución se muestren accidentalmente en la otra.
+            // La matriz en memoria se limpia al cambiar de institución; cada institución
+            // conserva su propio documento en Firestore.
             if (Object.keys(scheduleData || {}).length) {
                 const ok = confirm("Volver al Home cambiará el área de trabajo. La matriz temporal actual se limpiará porque el historial está desactivado. ¿Continuar?");
                 if (!ok) return;
@@ -1027,10 +1070,15 @@
             scheduleData = {};
             renderShiftLegend();
             initTable();
+            loadFirebaseSchedule().catch(error => {
+                console.error("No se pudo recuperar el horario de Firebase:", error);
+                alert("No se pudo recuperar el horario guardado: " + firebaseErrorMessage(error));
+            });
             refreshIcons();
         }
 
         function logout() {
+            firebaseAuth.signOut().catch(error => console.warn("No se pudo cerrar la sesión de Firebase:", error));
             currentUsername = "";
             currentBaseUsername = "";
             currentLoginPassword = "";
@@ -1072,8 +1120,118 @@
             });
         }
 
+        function changeSchedulePeriod() {
+            initTable();
+            loadFirebaseSchedule().catch(error => {
+                console.error("Error recuperando el período:", error);
+                alert("No se pudo cargar este período desde Firebase: " + firebaseErrorMessage(error));
+            });
+        }
+
         function currentPeriod() {
             return document.getElementById("month-picker").value;
+        }
+
+        function firebaseScheduleRef() {
+            const user = firebaseAuth.currentUser;
+            const period = currentPeriod();
+            if (!user || !currentInstitution || !/^\d{4}-(0[1-9]|1[0-2])$/.test(period)) return null;
+            return firestoreDb.collection("users").doc(user.uid)
+                .collection("institutions").doc(currentInstitution)
+                .collection("schedules").doc(period);
+        }
+
+        function firebaseErrorMessage(error) {
+            if (error?.code === "permission-denied") {
+                return "Firestore rechazó el acceso. Compruebe que el correo de Firebase esté verificado y que las reglas permitan guardar horarios.";
+            }
+            if (error?.code === "unavailable") return "Firebase no está disponible. Revise su conexión a Internet.";
+            return error?.message || String(error || "Error desconocido");
+        }
+
+        async function saveFirebaseSchedule() {
+            const user = firebaseAuth.currentUser;
+            const ref = firebaseScheduleRef();
+            if (!user || !ref || !Object.keys(scheduleData || {}).length) return false;
+
+            const cleanSchedule = {};
+            Object.keys(scheduleData).forEach(day => {
+                cleanSchedule[String(day)] = {};
+                Object.keys(scheduleData[day] || {}).forEach(empId => {
+                    cleanSchedule[String(day)][String(empId)] = String(scheduleData[day][empId] || "LIBRE");
+                });
+            });
+            const employees = EMPLOYEES.map(emp => ({
+                id: Number(emp.id), name: String(emp.name || ""),
+                role: String(emp.role || "-"), defaultShift: String(emp.defaultShift || "")
+            }));
+
+            firebaseSaveInProgress = firebaseSaveInProgress.catch(() => {}).then(() => ref.set({
+                ownerUid: user.uid,
+                institution: currentInstitution,
+                period: currentPeriod(),
+                scheduleData: cleanSchedule,
+                employees,
+                revision: Date.now(),
+                updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+                updatedBy: user.email || ""
+            }, { merge: true }));
+            await firebaseSaveInProgress;
+            console.log("Horario guardado en Firestore:", currentInstitution, currentPeriod());
+            return true;
+        }
+
+        function queueFirebaseScheduleSave() {
+            if (!firebaseAuth.currentUser || !currentInstitution) return;
+            clearTimeout(firebaseSaveTimer);
+            firebaseSaveTimer = setTimeout(async () => {
+                try {
+                    await saveFirebaseSchedule();
+                } catch (error) {
+                    console.error("Error guardando horario en Firestore:", error);
+                    const notice = document.getElementById("loginNotice");
+                    if (notice) notice.textContent = "";
+                    alert("No se pudo guardar el horario en Firebase: " + firebaseErrorMessage(error));
+                }
+            }, 650);
+        }
+
+        async function loadFirebaseSchedule() {
+            const user = firebaseAuth.currentUser;
+            const ref = firebaseScheduleRef();
+            if (!user || !ref) return false;
+            const snapshot = await ref.get();
+            if (!snapshot.exists) {
+                console.log("No hay horario previo en Firestore para este período.");
+                return false;
+            }
+            const saved = snapshot.data() || {};
+            if (saved.ownerUid !== user.uid || saved.institution !== currentInstitution || saved.period !== currentPeriod()) {
+                throw new Error("El documento recuperado no corresponde a esta cuenta, institución o período.");
+            }
+            if (Array.isArray(saved.employees) && saved.employees.length) {
+                const currentIds = new Set(EMPLOYEES.map(e => String(e.id)));
+                const savedIds = new Set(saved.employees.map(e => String(e.id)));
+                if (currentIds.size === savedIds.size && [...currentIds].every(id => savedIds.has(id))) {
+                    EMPLOYEES = saved.employees.map(e => ({ ...e }));
+                    initTable();
+                }
+            }
+            if (saved.scheduleData && typeof saved.scheduleData === "object") {
+                Object.keys(scheduleData).forEach(day => {
+                    const row = saved.scheduleData[day];
+                    if (!row) return;
+                    EMPLOYEES.forEach(emp => {
+                        const value = row[String(emp.id)];
+                        if (value && (SHIFTS[value] || value === "LIBRE")) scheduleData[day][emp.id] = value;
+                    });
+                });
+                EMPLOYEES.forEach(emp => updateEmployeeColumnUI(emp.id));
+                calculateTotals();
+                validateCoverage();
+            }
+            console.log("Horario recuperado de Firestore:", currentInstitution, currentPeriod());
+            return true;
         }
 
         // Google Sheets puede devolver códigos numéricos sin sus ceros iniciales.
@@ -1160,8 +1318,8 @@
             }
 
             renderFooterRow();
-            // Los horarios se mantienen únicamente en la sesión actual.
-            // No se consulta ni se guarda ningún historial externo.
+            calculateTotals();
+            validateCoverage();
         }
 
         function onRoleChange(empId, newRole) {
@@ -1171,6 +1329,7 @@
                 applyRoleLogicForEmployee(empId);
                 calculateTotals();
                 validateCoverage();
+                queueFirebaseScheduleSave();
             }
         }
 
@@ -1271,6 +1430,7 @@
                 if (cell) cell.innerHTML = renderCellContent(SHIFTS[shiftKey]);
                 calculateTotals();
                 validateCoverage();
+                queueFirebaseScheduleSave();
             }
             closeModal();
         }
@@ -1279,6 +1439,7 @@
             EMPLOYEES.forEach(emp => applyRoleLogicForEmployee(emp.id));
             calculateTotals();
             validateCoverage();
+            queueFirebaseScheduleSave();
         }
 
         function clearSchedule() {
@@ -1290,9 +1451,10 @@
             EMPLOYEES.forEach(emp => updateEmployeeColumnUI(emp.id));
             calculateTotals();
             validateCoverage();
+            queueFirebaseScheduleSave();
         }
 
-        function populateSampleData() { EMPLOYEES.forEach(emp => applyRoleLogicForEmployee(emp.id)); calculateTotals(); validateCoverage(); }
+        function populateSampleData() { EMPLOYEES.forEach(emp => applyRoleLogicForEmployee(emp.id)); calculateTotals(); validateCoverage(); queueFirebaseScheduleSave(); }
 
         function calculateTotals() {
             const [year, month] = document.getElementById('month-picker').value.split('-').map(Number);
@@ -2446,6 +2608,7 @@
       validRows.forEach(r=>{scheduleData[r.day][r.empId]=r.code;});
       EMPLOYEES.forEach(emp=>updateEmployeeColumnUI(emp.id));
       calculateTotals(); validateCoverage();
+      queueFirebaseScheduleSave();
       closeScheduleImport();
       alert(`Importación aplicada: ${validRows.length} asignaciones. Revisa la matriz.`);
     }
