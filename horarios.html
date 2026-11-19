@@ -258,7 +258,7 @@
                         <label class="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1.5">Usuario</label>
                         <div class="relative flex items-center">
                             <i data-lucide="user" class="w-4 h-4 text-sky-400 absolute left-3"></i>
-                            <input id="loginUser" type="text" placeholder="Usuario" class="input-neo w-full pl-10 pr-4 py-2.5 rounded-xl text-xs font-semibold" required autocomplete="off">
+                            <input id="loginUser" type="text" placeholder="Correo electrónico" class="input-neo w-full pl-10 pr-4 py-2.5 rounded-xl text-xs font-semibold" required autocomplete="off">
                         </div>
                     </div>
 
@@ -605,15 +605,7 @@
         const firestoreDb = firebase.firestore();
         let firebaseSaveTimer = null;
         let firebaseSaveInProgress = Promise.resolve();
-        const FIREBASE_EMAIL_BY_ACCOUNT = {
-            // Las claves coinciden con el usuario que devuelve baseAccountName().
-            // Se admiten tanto los nombres cortos como los correos usados en la hoja.
-            carlos: "carlosmarcenaro64@gmail.com",
-            krissia: "Krissia.rosa@isss.gob.sv",
-            "carlosmarcenaro64@gmail.com": "carlosmarcenaro64@gmail.com",
-            "krissia.rosa@isss.gob.sv": "Krissia.rosa@isss.gob.sv",
-            "dani.iraheta6@gmail.com": "dani.iraheta6@gmail.com"
-        };
+        const FIREBASE_EMAIL_BY_ACCOUNT = {}; // El correo se obtiene de la columna A de Hoja 1.
 
         // ESTADO Y LÓGICA DE TEMA (CLARO / OSCURO)
         let isDarkMode = false;
@@ -673,7 +665,7 @@
         };
 
         let currentUsername = "";          // Cuenta institucional activa: *_isss o *_minsal
-        let currentBaseUsername = "";      // Usuario principal: krissia o carlos
+        let currentBaseUsername = "";      // Correo autenticado en Firebase
         let currentLoginPassword = "";     // Se conserva solo en memoria durante la sesión
         let currentInstitution = "";
         let EMPLOYEES = [];
@@ -804,12 +796,7 @@
 
         function canonicalAccountName(value) {
             const user = String(value == null ? "" : value).trim().toLocaleLowerCase("es");
-            const aliases = {
-                "krissia": "krissia_isss",
-                "krissiaminsal": "krissia_minsal",
-                "carlos": "carlos_isss"
-            };
-            return aliases[user] || user;
+            return user;
         }
 
         function baseAccountName(value) {
@@ -845,10 +832,10 @@
 
             for (let i = 1; i < rows.length; i++) {
                 const cols = rows[i].map(clean);
-                // Hoja principal: A-B usuarios; D-G personal; I-K roles; M-P turnos.
-                const user = key(cols[0]); // A:B contiene usuarios base: krissia / carlos.
-                const password = clean(cols[1]);
-                if (user && password) parsedUsers[user] = { password };
+                // Hoja principal: A=correo, B=UID Firebase; D-G personal; I-K roles; M-P turnos.
+                const user = key(cols[0]);
+                const uid = clean(cols[1]);
+                if (user && uid) parsedUsers[user] = { uid, email: user };
 
                 const employeeUser = canonicalAccountName(cols[3]);
                 const employeeId = Number.parseInt(clean(cols[4]), 10);
@@ -892,12 +879,38 @@
                 }
             }
 
-            if (!Object.keys(parsedUsers).length) return false;
-            DB_USERS = parsedUsers;
+            if (Object.keys(parsedUsers).length) DB_USERS = parsedUsers;
+            if (!Object.keys(DB_USERS).length && !Object.keys(parsedEmployeesByUser).length) return false;
             DB_EMPLOYEES_BY_USER = parsedEmployeesByUser;
             window.DB_ROLES_BY_USER = parsedRolesByUser;
             window.DB_SHIFTS_BY_USER = parsedShiftsByUser;
             return true;
+        }
+
+        async function callAppsScript(payload) {
+            const user = firebaseAuth.currentUser;
+            if (!user) throw new Error("No hay una sesión activa de Firebase.");
+            payload.idToken = await user.getIdToken(true);
+            payload.requestId = "req_" + Date.now() + "_" + Math.random().toString(36).slice(2);
+            return new Promise((resolve, reject) => {
+                const iframe = document.createElement("iframe");
+                iframe.name = payload.requestId; iframe.style.display = "none";
+                document.body.appendChild(iframe);
+                const form = document.createElement("form");
+                form.method = "POST"; form.action = GOOGLE_APPS_SCRIPT_URL;
+                form.target = payload.requestId; form.style.display = "none";
+                const input = document.createElement("input"); input.name = "payload";
+                input.value = JSON.stringify(payload); form.appendChild(input); document.body.appendChild(form);
+                const finish = (err, value) => { clearTimeout(timer); window.removeEventListener("message", listener); form.remove(); iframe.remove(); err ? reject(err) : resolve(value); };
+                const timer = setTimeout(() => finish(new Error("Apps Script no respondió. Comprueba que desplegaste la versión nueva.")), 25000);
+                const listener = event => {
+                    const d = event.data;
+                    if (!d || d.channel !== "CONTROL_HORARIOS_MIGRATION" || d.requestId !== payload.requestId) return;
+                    if (d.payload && d.payload.status === "success") finish(null, d.payload);
+                    else finish(new Error(d.payload?.message || "Apps Script rechazó la solicitud."));
+                };
+                window.addEventListener("message", listener); form.submit();
+            });
         }
 
         function setupLoginLogic() {
@@ -910,7 +923,7 @@
 
             loginForm.addEventListener('submit', async e => {
                 e.preventDefault();
-                const entered = baseAccountName(document.querySelector('#loginUser').value);
+                const entered = String(document.querySelector('#loginUser').value || "").trim().toLowerCase();
                 const password = document.querySelector('#loginPassword').value;
                 const submitButton = loginForm.querySelector('button[type="submit"]');
 
@@ -926,20 +939,16 @@
                     const catalogOk = catalogLoadPromise ? await catalogLoadPromise : false;
                     if (!catalogOk) throw new Error("No se pudo conectar con la hoja principal.");
 
-                    // A:B autentica al usuario base una sola vez.
-                    // El sufijo _isss / _minsal solo separa los datos institucionales.
-                    const baseAccount = DB_USERS[entered];
-                    const validBase = baseAccount &&
-                        String(baseAccount.password) === String(password);
-                    if (!validBase) {
-                        throw new Error("Usuario o contraseña incorrectos. Verifique el usuario y la contraseña en A:B.");
-                    }
-
-                    // Se autentica también contra Firebase con el mismo correo y contraseña.
-                    const firebaseEmail = FIREBASE_EMAIL_BY_ACCOUNT[entered];
-                    if (!firebaseEmail) throw new Error("Esta cuenta aún no tiene un correo vinculado a Firebase.");
+                    // La contraseña se valida exclusivamente en Firebase Authentication.
+                    // La hoja A:B solo relaciona correo con UID; nunca almacena contraseñas.
+                    const account = DB_USERS[entered];
+                    if (!account || !account.uid) throw new Error("El correo no está registrado en A:B o no tiene UID de Firebase.");
                     try {
-                        await firebaseAuth.signInWithEmailAndPassword(firebaseEmail, password);
+                        const credential = await firebaseAuth.signInWithEmailAndPassword(entered, password);
+                        if (!credential.user || credential.user.uid !== account.uid) {
+                            await firebaseAuth.signOut();
+                            throw new Error("El UID autenticado no coincide con el UID de la columna B. Revisa la hoja Hoja 1.");
+                        }
                     } catch (firebaseError) {
                         console.error("Firebase Authentication:", firebaseError);
                         const messages = {
@@ -949,6 +958,11 @@
                             "auth/too-many-requests": "Firebase bloqueó temporalmente los intentos. Espere e inténtelo nuevamente."
                         };
                         throw new Error(messages[firebaseError.code] || ("No se pudo iniciar sesión en Firebase: " + (firebaseError.message || firebaseError.code)));
+                    }
+
+                    const catalog = await callAppsScript({ action: "loadCatalog" });
+                    if (!Array.isArray(catalog.data) || !parseCSVData(catalog.data)) {
+                        throw new Error("Firebase autenticó la cuenta, pero no se pudo cargar su personal, roles y turnos desde Hoja 1.");
                     }
 
                     currentBaseUsername = entered;
@@ -1515,6 +1529,7 @@
 
         async function sendToGoogleSheet(payload) {
             try {
+                if (firebaseAuth.currentUser) payload.idToken = await firebaseAuth.currentUser.getIdToken();
                 await fetch(GOOGLE_APPS_SCRIPT_URL, {
                     method: 'POST', mode: 'no-cors',
                     headers: { 'Content-Type': 'text/plain' },
@@ -2199,11 +2214,11 @@
      <div class="hub-card"><div class="hub-muted">Administrador principal</div><div class="text-sm font-bold text-emerald-300 mt-2">Carlos</div></div>
     </div>
     <div class="hub-card mb-3"><h3 class="font-bold">Crear usuario</h3><p class="hub-muted mt-1 mb-3">Crea cuentas manualmente. Cada usuario podrá elegir ISSS o MINSAL al iniciar sesión.</p>
-     <div class="grid sm:grid-cols-2 gap-3"><input id="hub-create-user" class="hub-field" type="text" maxlength="40" placeholder="Nombre de usuario"><input id="hub-create-pass" class="hub-field" type="password" maxlength="100" placeholder="Contraseña inicial"></div>
+     <div class="grid sm:grid-cols-2 gap-3"><input id="hub-create-user" class="hub-field" type="email" maxlength="120" placeholder="Correo electrónico"><input id="hub-create-pass" class="hub-field" type="password" minlength="6" maxlength="100" placeholder="Contraseña inicial (mínimo 6)"></div>
      <button class="hub-primary mt-3" onclick="adminCreateUser()">Crear cuenta</button><p id="hub-admin-notice" class="hub-muted mt-3" role="status"></p>
     </div>
     <div class="hub-card"><div class="flex items-center justify-between gap-2 mb-3"><h3 class="font-bold">Cuentas registradas</h3><button class="account-action" onclick="refreshAdminUsers()">↻ Actualizar</button></div>
-     <p class="hub-muted mb-3">Puedes cambiar el nombre de usuario y/o establecer una contraseña nueva. No se muestra ninguna contraseña existente.</p>
+     <p class="hub-muted mb-3">Administra correo, contraseña, bloqueo y acceso. Los UID existentes se conservan.</p>
      <div id="hub-user-list" class="space-y-2"></div>
     </div>
    </div>
@@ -2214,7 +2229,7 @@
 <script>
 (function(){
  const $=id=>document.getElementById(id);
- const isAdmin=()=>String(typeof currentBaseUsername!=='undefined'?currentBaseUsername:'').trim().toLowerCase()==='carlos';
+ const isAdmin=()=>String(firebaseAuth.currentUser?.email||'').trim().toLowerCase()==='carlosmarcenaro64@gmail.com';
  function addAccountButtons(){
   const header=document.querySelector('#app-container header .max-w-7xl > .flex.items-center.space-x-2');
   if(!header||$('account-tools'))return;
@@ -2237,88 +2252,78 @@
  window.closeAccountHub=function(){$('account-hub').classList.remove('open');$('account-hub').setAttribute('aria-hidden','true')};
  window.switchHubTab=function(tab){if(tab==='admin'&&!isAdmin())tab='profile';document.querySelectorAll('.hub-tab').forEach(x=>x.classList.toggle('active',x.dataset.hubTab===tab));document.querySelectorAll('.hub-panel').forEach(x=>x.classList.toggle('active',x.id==='hub-'+tab))};
  function notice(id,msg,ok=false){const el=$(id);if(!el)return;el.textContent=msg;el.style.color=ok?'#86efac':'#fca5a5'}
- async function postAccountAction(payload,verify){
-  if(!isAdmin() && payload.action!=='changeOwnPassword')throw new Error('Solo Carlos puede administrar cuentas.');
-  payload.adminUser=(typeof currentBaseUsername!=='undefined'?currentBaseUsername:'');
-  payload.adminPassword=(typeof currentLoginPassword!=='undefined'?currentLoginPassword:'');
-  await fetch(GOOGLE_APPS_SCRIPT_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify(payload)});
-  // Apps Script no expone la respuesta del POST en modo no-cors. Confirmamos
-  // el resultado leyendo de nuevo el catálogo hasta observar el cambio esperado.
-  for(let i=0;i<8;i++){
-   await new Promise(r=>setTimeout(r,500));
-   const ok=await syncFromGoogleSheet();
-   if(ok&&verify())return true;
-  }
-  throw new Error('No se pudo confirmar el cambio en Google Sheets. Revisa la implementación del Apps Script.');
+ async function postAccountAction(payload){
+  if(!isAdmin())throw new Error('Solo Carlos puede administrar cuentas.');
+  const user=firebaseAuth.currentUser;
+  if(!user)throw new Error('La sesión de Firebase expiró. Vuelve a iniciar sesión.');
+  const idToken=await user.getIdToken(true);
+  const requestId='admin_'+Date.now()+'_'+Math.random().toString(36).slice(2);
+  payload.idToken=idToken;payload.requestId=requestId;
+  return new Promise((resolve,reject)=>{
+   const iframe=document.createElement('iframe');iframe.name=requestId;iframe.style.display='none';document.body.appendChild(iframe);
+   const form=document.createElement('form');form.method='POST';form.action=GOOGLE_APPS_SCRIPT_URL;form.target=requestId;form.style.display='none';
+   const input=document.createElement('input');input.name='payload';input.value=JSON.stringify(payload);form.appendChild(input);document.body.appendChild(form);
+   const timer=setTimeout(()=>finish(new Error('Tiempo agotado esperando Apps Script. Revisa que hayas desplegado la versión nueva.')),25000);
+   function finish(err,data){clearTimeout(timer);window.removeEventListener('message',listener);form.remove();iframe.remove();if(err)reject(err);else resolve(data)}
+   function listener(event){const d=event.data;if(!d||d.channel!=='CONTROL_HORARIOS_MIGRATION'||d.requestId!==requestId)return; if(d.payload?.status==='success')finish(null,d.payload);else finish(new Error(d.payload?.message||'Apps Script rechazó la operación.'))}
+   window.addEventListener('message',listener);form.submit();
+  });
  }
  window.refreshAdminUsers=async function(){
-  if(!isAdmin()){notice('hub-admin-notice','Acceso exclusivo del administrador.');return}
+  if(!isAdmin()){notice('hub-admin-notice','Acceso exclusivo de Carlos.');return}
   const box=$('hub-user-list');box.innerHTML='<p class="hub-muted">Cargando cuentas…</p>';
-  const ok=await syncFromGoogleSheet();if(!ok){box.innerHTML='<p class="text-rose-300 text-xs">No se pudo actualizar el catálogo.</p>';return}
-  const users=Object.keys(DB_USERS||{}).sort((a,b)=>a.localeCompare(b,'es'));
-  $('hub-stat-users').textContent=String(users.length);box.innerHTML='';
-  users.forEach(user=>{
-   const row=document.createElement('div');row.className='hub-user-row rounded-xl border border-slate-700 bg-slate-900/70 p-3';
-   const name=document.createElement('strong');name.className='hub-user-name text-sm break-all';name.textContent=user;
-   const rename=document.createElement('input');rename.className='hub-field';rename.value=user;rename.maxLength=40;rename.setAttribute('aria-label','Nuevo nombre de usuario para '+user);
-   const pass=document.createElement('input');pass.className='hub-field';pass.type='password';pass.maxLength=100;pass.placeholder='Nueva contraseña';pass.setAttribute('aria-label','Nueva contraseña para '+user);
-   const save=document.createElement('button');save.className='hub-primary';save.textContent='Guardar';save.disabled=user==='carlos';save.title=user==='carlos'?'El usuario administrador no se puede renombrar':'Guardar cambios';
-   save.onclick=()=>adminUpdateUser(user,rename.value.trim().toLowerCase(),pass.value);
-   const del=document.createElement('button');del.className='hub-danger';del.textContent='Eliminar';del.disabled=user==='carlos';del.title=user==='carlos'?'No puedes eliminar al administrador principal':'';
-   del.onclick=()=>adminDeleteUser(user);
-   row.append(name,rename,pass,save,del);box.appendChild(row);
-  });
-  if(!users.length)box.innerHTML='<p class="hub-muted">No hay cuentas registradas.</p>';
+  try{
+   const result=await postAccountAction({action:'adminListUsers'});
+   const users=result.users||[];$('hub-stat-users').textContent=String(users.length);box.innerHTML='';
+   users.forEach(item=>{
+    const row=document.createElement('div');row.className='hub-user-row rounded-xl border border-slate-700 bg-slate-900/70 p-3 space-y-2';
+    const title=document.createElement('strong');title.className='block text-sm break-all';title.textContent=item.email+' · '+(item.disabled?'BLOQUEADO':'ACTIVO');
+    const uid=document.createElement('small');uid.className='block text-slate-400 break-all';uid.textContent='UID: '+item.uid;
+    const email=document.createElement('input');email.className='hub-field';email.type='email';email.value=item.email;email.placeholder='Correo nuevo';
+    const pass=document.createElement('input');pass.className='hub-field';pass.type='password';pass.minLength=6;pass.placeholder='Nueva contraseña (opcional)';
+    const save=document.createElement('button');save.className='hub-primary';save.textContent='Guardar cambios';save.disabled=item.email.toLowerCase()==='carlosmarcenaro64@gmail.com';save.onclick=()=>adminUpdateUser(item.email,email.value.trim(),pass.value);
+    const toggle=document.createElement('button');toggle.className='account-action';toggle.textContent=item.disabled?'Desbloquear':'Bloquear';toggle.disabled=item.email.toLowerCase()==='carlosmarcenaro64@gmail.com';toggle.onclick=()=>adminSetBlocked(item.email,!item.disabled);
+    const del=document.createElement('button');del.className='hub-danger';del.textContent='Eliminar';del.disabled=item.email.toLowerCase()==='carlosmarcenaro64@gmail.com';del.onclick=()=>adminDeleteUser(item.email);
+    row.append(title,uid,email,pass,save,toggle,del);box.appendChild(row);
+   });
+   if(!users.length)box.innerHTML='<p class="hub-muted">No hay cuentas registradas.</p>';
+  }catch(e){box.innerHTML='<p class="text-rose-300 text-xs"></p>';box.firstChild.textContent=e.message||'No se pudo cargar la administración.'}
  };
  window.adminCreateUser=async function(){
-  if(!isAdmin()){notice('hub-admin-notice','Acceso exclusivo de Carlos.');return}
-  const username=$('hub-create-user').value.trim().toLowerCase(),password=$('hub-create-pass').value;
-  if(!/^[a-z0-9._-]{3,40}$/.test(username)){notice('hub-admin-notice','Usa 3 a 40 caracteres: letras, números, punto, guion o guion bajo.');return}
-  if(!password){notice('hub-admin-notice','La contraseña inicial es obligatoria.');return}
-  if(DB_USERS[username]){notice('hub-admin-notice','Ese usuario ya existe.');return}
-  try{
-   notice('hub-admin-notice','Creando cuenta…',true);
-   await postAccountAction({action:'adminCreateUser',usuario:username,contrasena:password},()=>Boolean(DB_USERS[username]));
-   $('hub-create-user').value='';$('hub-create-pass').value='';notice('hub-admin-notice','Cuenta creada correctamente.',true);await refreshAdminUsers();
-  }catch(e){notice('hub-admin-notice',e.message||'No se pudo crear la cuenta.')}
+  if(!isAdmin())return notice('hub-admin-notice','Acceso exclusivo de Carlos.');
+  const email=$('hub-create-user').value.trim().toLowerCase(),password=$('hub-create-pass').value;
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return notice('hub-admin-notice','Escribe un correo válido.');
+  if(password.length<6)return notice('hub-admin-notice','La contraseña inicial debe tener al menos 6 caracteres.');
+  try{notice('hub-admin-notice','Creando usuario en Firebase…',true);await postAccountAction({action:'adminCreateUser',email,password});$('hub-create-user').value='';$('hub-create-pass').value='';notice('hub-admin-notice','Usuario creado en Firebase y registrado en Sheets.',true);await refreshAdminUsers()}
+  catch(e){notice('hub-admin-notice',e.message||'No se pudo crear el usuario.')}
  };
- window.adminUpdateUser=async function(oldUser,newUser,newPass){
+ window.adminUpdateUser=async function(oldEmail,newEmail,newPass){
   if(!isAdmin())return alert('Acceso exclusivo de Carlos.');
-  if(oldUser==='carlos')return alert('El usuario administrador principal no se puede renombrar. Puedes cambiar su contraseña desde Seguridad.');
-  if(!/^[a-z0-9._-]{3,40}$/.test(newUser))return alert('El nuevo usuario debe tener de 3 a 40 caracteres válidos.');
-  if(newUser!==oldUser&&DB_USERS[newUser])return alert('Ya existe una cuenta con ese nombre.');
-  if(newUser===oldUser&&!newPass)return alert('Escribe un nombre nuevo o una contraseña nueva para guardar cambios.');
-  try{
-   notice('hub-admin-notice','Guardando cambios…',true);
-   await postAccountAction({action:'adminUpdateUser',usuario_anterior:oldUser,usuario_nuevo:newUser,contrasena_nueva:newPass||''},()=>Boolean(DB_USERS[newUser])&&(!newPass||String(DB_USERS[newUser].password)===String(newPass))&&!DB_USERS[oldUser]||Boolean(DB_USERS[newUser])&&oldUser===newUser&&(!newPass||String(DB_USERS[newUser].password)===String(newPass)));
-   notice('hub-admin-notice','Cuenta actualizada correctamente.',true);await refreshAdminUsers();
-  }catch(e){notice('hub-admin-notice',e.message||'No se pudo actualizar la cuenta.')}
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail))return alert('Correo nuevo no válido.');
+  if(newPass&&newPass.length<6)return alert('La contraseña debe tener al menos 6 caracteres.');
+  try{notice('hub-admin-notice','Actualizando Firebase y Sheets…',true);await postAccountAction({action:'adminUpdateUser',emailAnterior:oldEmail,emailNuevo:newEmail,password:newPass||''});notice('hub-admin-notice','Cuenta actualizada.',true);await refreshAdminUsers()}
+  catch(e){notice('hub-admin-notice',e.message||'No se pudo actualizar.')}
  };
- window.adminDeleteUser=async function(user){
+ window.adminSetBlocked=async function(email,blocked){
   if(!isAdmin())return alert('Acceso exclusivo de Carlos.');
-  if(user==='carlos')return alert('No se puede eliminar la cuenta del administrador principal.');
-  if(!confirm('¿Eliminar la cuenta '+user+'? Sus registros de personal, roles y turnos se conservarán en la hoja, pero ya no podrá iniciar sesión.'))return;
-  try{
-   notice('hub-admin-notice','Eliminando cuenta…',true);
-   await postAccountAction({action:'adminDeleteUser',usuario: user},()=>!DB_USERS[user]);
-   notice('hub-admin-notice','Cuenta eliminada. Los datos institucionales se conservaron.',true);await refreshAdminUsers();
-  }catch(e){notice('hub-admin-notice',e.message||'No se pudo eliminar la cuenta.')}
+  if(!confirm((blocked?'¿Bloquear ':'¿Desbloquear ')+email+'?'))return;
+  try{notice('hub-admin-notice','Actualizando estado…',true);await postAccountAction({action:'adminSetBlocked',email,blocked});notice('hub-admin-notice','Estado actualizado.',true);await refreshAdminUsers()}
+  catch(e){notice('hub-admin-notice',e.message||'No se pudo cambiar el estado.')}
+ };
+ window.adminDeleteUser=async function(email){
+  if(!isAdmin())return alert('Acceso exclusivo de Carlos.');
+  if(email.toLowerCase()==='carlosmarcenaro64@gmail.com')return alert('No puedes eliminar al administrador principal.');
+  if(!confirm('¿Eliminar '+email+' de Firebase Authentication y Sheets? Los horarios históricos de Firestore no se borrarán.'))return;
+  try{notice('hub-admin-notice','Eliminando usuario…',true);await postAccountAction({action:'adminDeleteUser',email});notice('hub-admin-notice','Usuario eliminado. Los horarios históricos se conservaron.',true);await refreshAdminUsers()}
+  catch(e){notice('hub-admin-notice',e.message||'No se pudo eliminar.')}
  };
  window.changeOwnPassword=async function(){
   const oldPass=$('hub-current-pass').value,newPass=$('hub-new-pass').value,confirmPass=$('hub-confirm-pass').value;
   if(!oldPass||!newPass||!confirmPass)return notice('hub-security-notice','Completa los tres campos.');
   if(newPass!==confirmPass)return notice('hub-security-notice','Las contraseñas nuevas no coinciden.');
-  if(newPass.length<4)return notice('hub-security-notice','La contraseña debe tener al menos 4 caracteres.');
-  const user=(typeof currentBaseUsername!=='undefined'?currentBaseUsername:'');
-  if(String(DB_USERS[user]?.password)!==String(oldPass))return notice('hub-security-notice','La contraseña actual no es correcta.');
-  try{
-   notice('hub-security-notice','Actualizando contraseña…',true);
-   await fetch(GOOGLE_APPS_SCRIPT_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain'},body:JSON.stringify({action:'changeOwnPassword',usuario:user,contrasena_actual:oldPass,contrasena_nueva:newPass})});
-   let changed=false;
-   for(let i=0;i<8;i++){await new Promise(r=>setTimeout(r,500));if(await syncFromGoogleSheet()&&String(DB_USERS[user]?.password)===String(newPass)){changed=true;break}}
-   if(!changed)throw new Error('No se pudo confirmar el cambio en Google Sheets.');
-   currentLoginPassword=newPass;$('hub-current-pass').value='';$('hub-new-pass').value='';$('hub-confirm-pass').value='';notice('hub-security-notice','Contraseña actualizada correctamente.',true);
-  }catch(e){notice('hub-security-notice',e.message||'No se pudo cambiar la contraseña.')}
+  if(newPass.length<6)return notice('hub-security-notice','La contraseña debe tener al menos 6 caracteres.');
+  try{const cred=await firebaseAuth.currentUser.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(firebaseAuth.currentUser.email,oldPass));await firebaseAuth.currentUser.updatePassword(newPass);$('hub-current-pass').value='';$('hub-new-pass').value='';$('hub-confirm-pass').value='';notice('hub-security-notice','Contraseña actualizada en Firebase.',true)}
+  catch(e){notice('hub-security-notice',e.message||'No se pudo cambiar la contraseña.')}
  };
  window.addEventListener('load',()=>{addAccountButtons();if(window.lucide)lucide.createIcons()});
  const app=$('app-container');if(app){new MutationObserver(()=>{if(!app.classList.contains('hidden'))addAccountButtons()}).observe(app,{attributes:true,attributeFilter:['class']})}
