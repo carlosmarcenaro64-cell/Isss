@@ -336,6 +336,10 @@
                         <i data-lucide="sparkles" class="w-4 h-4 stroke-[2.5]"></i>
                         <span>Generar Auto</span>
                     </button>
+                    <button type="button" id="btn-general-report" onclick="generateGeneralReport()" class="px-3 py-2 bg-emerald-100 dark:bg-emerald-900/40 hover:bg-emerald-200 dark:hover:bg-emerald-900/60 border border-emerald-300 dark:border-emerald-500/40 text-emerald-800 dark:text-emerald-200 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition" title="Generar reporte completo en texto para copiar y pegar">
+                        <i data-lucide="file-text" class="w-4 h-4"></i>
+                        <span>Reporte</span>
+                    </button>
                     <button onclick="clearSchedule()" class="px-3 py-2 bg-slate-200 dark:bg-slate-900 hover:bg-slate-300 dark:hover:bg-slate-800 border border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition">
                         <i data-lucide="rotate-ccw" class="w-4 h-4 text-amber-500"></i>
                         <span>Limpiar Tabla</span>
@@ -579,6 +583,32 @@
             </div>
             <div class="flex justify-end pt-3 border-t border-slate-200 dark:border-slate-800 mt-3">
                 <button onclick="closeRoleManager()" class="px-4 py-1.5 bg-slate-200 dark:bg-slate-900 text-slate-700 dark:text-slate-300 text-xs rounded-xl font-semibold">Cerrar</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de reporte general en texto plano -->
+    <div id="general-report-modal" class="fixed inset-0 z-[120] hidden items-center justify-center bg-slate-950/70 backdrop-blur-sm p-3" role="dialog" aria-modal="true" aria-labelledby="general-report-title">
+        <div class="w-full max-w-4xl max-h-[92vh] flex flex-col bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl shadow-2xl overflow-hidden">
+            <div class="flex items-center justify-between gap-3 p-4 border-b border-slate-200 dark:border-slate-700">
+                <div>
+                    <h2 id="general-report-title" class="font-extrabold text-slate-800 dark:text-white">Reporte general de horarios</h2>
+                    <p class="text-xs text-slate-500 dark:text-slate-400">Texto plano listo para copiar y pegar en otro programa.</p>
+                </div>
+                <button type="button" onclick="closeGeneralReport()" class="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500" aria-label="Cerrar reporte"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            <div class="p-3 flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 dark:border-slate-700">
+                <span id="general-report-status" class="text-xs text-slate-500 dark:text-slate-400">Reporte generado con los datos visibles del período seleccionado.</span>
+                <div class="flex gap-2">
+                    <button type="button" onclick="downloadGeneralReport()" class="px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-bold"><i data-lucide="download" class="w-3.5 h-3.5 inline mr-1"></i>Descargar TXT</button>
+                    <button type="button" onclick="copyGeneralReport()" class="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold"><i data-lucide="copy" class="w-3.5 h-3.5 inline mr-1"></i>Copiar todo</button>
+                </div>
+            </div>
+            <div class="p-3 flex-1 min-h-0">
+                <textarea id="general-report-text" readonly spellcheck="false" class="w-full h-[58vh] resize-y rounded-xl border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-100 p-3 font-mono text-xs leading-relaxed focus:outline-none focus:ring-2 focus:ring-emerald-500"></textarea>
+            </div>
+            <div class="px-4 pb-4 flex justify-end">
+                <button type="button" onclick="closeGeneralReport()" class="px-4 py-2 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-bold">Cerrar</button>
             </div>
         </div>
     </div>
@@ -1455,6 +1485,196 @@
             calculateTotals();
             validateCoverage();
             queueFirebaseScheduleSave();
+        }
+
+        // Genera un informe completo en texto plano para copiarlo a Word, Excel,
+        // correo, WhatsApp u otra aplicación. Usa el período y matriz actuales.
+        function buildGeneralReportText() {
+            if (!currentInstitution || !currentUsername) {
+                throw new Error("Primero selecciona ISSS o MINSAL para generar el reporte.");
+            }
+            if (!Array.isArray(EMPLOYEES) || !EMPLOYEES.length) {
+                throw new Error("No hay personal cargado para la institución seleccionada.");
+            }
+
+            const periodValue = document.getElementById("month-picker").value;
+            const [year, month] = periodValue.split("-").map(Number);
+            if (!year || !month) throw new Error("El período seleccionado no es válido.");
+            const daysInMonth = new Date(year, month, 0).getDate();
+            const monthName = new Intl.DateTimeFormat("es-SV", { month: "long", year: "numeric" })
+                .format(new Date(year, month - 1, 1));
+            const generatedAt = new Intl.DateTimeFormat("es-SV", {
+                dateStyle: "short", timeStyle: "medium"
+            }).format(new Date());
+            const targetHours = Number.parseFloat(document.getElementById("target-hours")?.value) || 160;
+            const lines = [];
+            const globalCounts = {};
+            let globalHours = 0;
+            let globalAssignments = 0;
+            let globalFreeDays = 0;
+            let globalVacationDays = 0;
+            let globalHolidayDays = 0;
+            let employeesWithObservations = 0;
+
+            const divider = "=".repeat(72);
+            lines.push("CONTROL DE HORARIOS " + currentInstitution);
+            lines.push("REPORTE GENERAL DE PROGRAMACIÓN");
+            lines.push(divider);
+            lines.push("Institución: " + currentInstitution);
+            lines.push("Cuenta institucional: " + currentUsername);
+            lines.push("Período: " + monthName.charAt(0).toLocaleUpperCase("es-SV") + monthName.slice(1));
+            lines.push("Fecha de generación: " + generatedAt);
+            lines.push("Empleados incluidos: " + EMPLOYEES.length);
+            lines.push("");
+            lines.push("RESUMEN GENERAL");
+            lines.push("- Meta de horas por empleado: " + targetHours + " horas");
+
+            const employeeReports = EMPLOYEES.map(emp => {
+                let hours = 0;
+                let assignments = 0;
+                let freeDays = 0;
+                let vacationDays = 0;
+                let holidayDays = 0;
+                let pendingDays = 0;
+                const detail = [];
+
+                for (let day = 1; day <= daysInMonth; day++) {
+                    const code = String(scheduleData?.[day]?.[emp.id] || "LIBRE").toUpperCase();
+                    const shift = SHIFTS[code] || null;
+                    const shiftHours = shift ? Number(shift.hours) || 0 : 0;
+                    const date = new Date(year, month - 1, day);
+                    const dayName = new Intl.DateTimeFormat("es-SV", { weekday: "short" }).format(date).replace(/\.$/, "").toUpperCase();
+                    const label = shift ? shift.label : "CÓDIGO NO DEFINIDO";
+
+                    if (code === "LIBRE") freeDays++;
+                    else if (code === "VAC") vacationDays++;
+                    else if (code === "ASUETO") holidayDays++;
+                    else if (code === "-" || code === "PENDIENTE") pendingDays++;
+                    else assignments++;
+
+                    hours += shiftHours;
+                    globalCounts[code] = (globalCounts[code] || 0) + 1;
+                    detail.push(String(day).padStart(2, "0") + " " + dayName.padEnd(3, " ") + " | " + code.padEnd(8, " ") + " | " + label + " | " + shiftHours + " h");
+                }
+
+                const observation = pendingDays > 0 || hours !== targetHours;
+                if (observation) employeesWithObservations++;
+                globalHours += hours;
+                globalAssignments += assignments;
+                globalFreeDays += freeDays;
+                globalVacationDays += vacationDays;
+                globalHolidayDays += holidayDays;
+
+                return { emp, hours, assignments, freeDays, vacationDays, holidayDays, pendingDays, observation, detail };
+            });
+
+            lines.push("- Turnos programados (sin contar LIBRE, VAC ni ASUETO): " + globalAssignments);
+            lines.push("- Días LIBRE: " + globalFreeDays);
+            lines.push("- Días VACACIONES: " + globalVacationDays);
+            lines.push("- Días ASUETO: " + globalHolidayDays);
+            lines.push("- Horas programadas acumuladas: " + globalHours);
+            lines.push("- Empleados con observaciones frente a la meta o días pendientes: " + employeesWithObservations);
+            lines.push("");
+            lines.push("RESUMEN POR CÓDIGO DE TURNO");
+            Object.keys(globalCounts).sort().forEach(code => {
+                const shift = SHIFTS[code];
+                lines.push("- " + code + " — " + (shift ? shift.label : "Código no definido") + ": " + globalCounts[code]);
+            });
+            lines.push("");
+            lines.push(divider);
+            lines.push("DETALLE POR EMPLEADO");
+            lines.push(divider);
+
+            employeeReports.forEach((report, index) => {
+                const emp = report.emp;
+                lines.push("");
+                lines.push("EMPLEADO " + (index + 1) + ": " + String(emp.name || "SIN NOMBRE").toLocaleUpperCase("es-SV"));
+                lines.push("ID: " + emp.id + " | Rol: " + (emp.role || "-") );
+                lines.push("Total de horas: " + report.hours + " | Meta: " + targetHours + " | Diferencia: " + (report.hours - targetHours));
+                lines.push("Turnos: " + report.assignments + " | LIBRE: " + report.freeDays + " | VAC: " + report.vacationDays + " | ASUETO: " + report.holidayDays + " | Pendientes: " + report.pendingDays);
+                lines.push("Detalle diario:");
+                lines.push(...report.detail);
+                if (report.observation) {
+                    const notes = [];
+                    if (report.hours !== targetHours) notes.push("Horas distintas de la meta (" + (report.hours - targetHours) + " h)");
+                    if (report.pendingDays) notes.push(report.pendingDays + " día(s) pendiente(s)");
+                    lines.push("OBSERVACIÓN: " + notes.join("; "));
+                } else {
+                    lines.push("OBSERVACIÓN: Sin diferencias frente a la meta de horas.");
+                }
+                lines.push("-".repeat(72));
+            });
+
+            lines.push("");
+            lines.push("OBSERVACIONES GENERALES");
+            lines.push("- Este reporte refleja la matriz cargada en pantalla al momento de generarlo.");
+            lines.push("- Los códigos y horas se toman de la leyenda de turnos configurada para esta cuenta.");
+            lines.push("- Los días LIBRE, VAC y ASUETO se detallan por separado y no se cuentan como turnos ordinarios.");
+            lines.push("");
+            lines.push("FIN DEL REPORTE");
+            return lines.join("\n");
+        }
+
+        function generateGeneralReport() {
+            try {
+                const text = buildGeneralReportText();
+                const textarea = document.getElementById("general-report-text");
+                textarea.value = text;
+                const modal = document.getElementById("general-report-modal");
+                modal.classList.remove("hidden");
+                modal.classList.add("flex");
+                document.getElementById("general-report-status").textContent =
+                    EMPLOYEES.length + " empleados · " + document.getElementById("month-picker").value + " · " + text.length.toLocaleString("es-SV") + " caracteres";
+                if (window.lucide) window.lucide.createIcons();
+                textarea.focus();
+                textarea.setSelectionRange(0, 0);
+            } catch (error) {
+                console.error("No se pudo generar el reporte general:", error);
+                alert(error.message || "No se pudo generar el reporte.");
+            }
+        }
+
+        function closeGeneralReport() {
+            const modal = document.getElementById("general-report-modal");
+            if (!modal) return;
+            modal.classList.add("hidden");
+            modal.classList.remove("flex");
+        }
+
+        async function copyGeneralReport() {
+            const textarea = document.getElementById("general-report-text");
+            const text = textarea.value || "";
+            if (!text) return;
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                } else {
+                    textarea.focus();
+                    textarea.select();
+                    if (!document.execCommand("copy")) throw new Error("El navegador no permitió copiar automáticamente.");
+                }
+                document.getElementById("general-report-status").textContent = "Reporte copiado. Ya puedes pegarlo en otro programa.";
+            } catch (error) {
+                textarea.focus();
+                textarea.select();
+                document.getElementById("general-report-status").textContent = "Seleccionamos el texto; presiona Ctrl+C para copiarlo.";
+            }
+        }
+
+        function downloadGeneralReport() {
+            const text = document.getElementById("general-report-text").value || "";
+            if (!text) return;
+            const period = document.getElementById("month-picker").value || "periodo";
+            const institution = String(currentInstitution || "institucion").toLowerCase();
+            const blob = new Blob(["\uFEFF", text], { type: "text/plain;charset=utf-8" });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "reporte_" + institution + "_" + period + ".txt";
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
         }
 
         function clearSchedule() {
